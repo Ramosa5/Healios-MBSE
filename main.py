@@ -3,6 +3,95 @@ import os
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import pyvista as pv
+
+
+
+def pv_plot_pointcloud(volume_bool: np.ndarray, voxel_mm: float, center_yz: bool = True,
+                       max_points: int = 500_000, point_size: float = 3.0, title="Point Cloud"):
+    if pv is None:
+        print("[PyVista] Brak pyvista. Zainstaluj: pip install pyvista")
+        return
+
+    pts = np.argwhere(volume_bool)  # (x,y,z) indeksy voxeli
+    if pts.size == 0:
+        print("[PyVista] volume pusty.")
+        return
+
+    if pts.shape[0] > max_points:
+        idx = np.random.choice(pts.shape[0], max_points, replace=False)
+        pts = pts[idx]
+
+    X, Y, Z = volume_bool.shape
+    cy = (Y - 1) / 2.0
+    cz = (Z - 1) / 2.0
+
+    xs = pts[:, 0].astype(np.float32) * voxel_mm
+    ys = pts[:, 1].astype(np.float32)
+    zs = pts[:, 2].astype(np.float32)
+
+    if center_yz:
+        ys = (ys - cy) * voxel_mm
+        zs = (zs - cz) * voxel_mm
+    else:
+        ys = ys * voxel_mm
+        zs = zs * voxel_mm
+
+    cloud = pv.PolyData(np.c_[xs, ys, zs])
+
+    p = pv.Plotter(title=title)
+    p.add_text(title, font_size=12)
+    p.add_points(cloud, render_points_as_spheres=True, point_size=point_size)
+    p.add_axes()
+    p.show_grid()
+    p.show()
+
+
+def pv_plot_isosurface(volume_bool: np.ndarray, voxel_mm: float, center_yz: bool = True,
+                       smooth_iters: int = 0, title="Isosurface"):
+    if volume_bool.ndim != 3:
+        raise ValueError("volume_bool musi być 3D")
+    if volume_bool.sum() == 0:
+        print("[PyVista] volume pusty.")
+        return
+
+    X, Y, Z = volume_bool.shape
+
+    grid = pv.ImageData()
+    grid.dimensions = (X + 1, Y + 1, Z + 1)  # punkty
+    grid.spacing = (voxel_mm, voxel_mm, voxel_mm)
+
+    if center_yz:
+        cy = (Y - 1) / 2.0
+        cz = (Z - 1) / 2.0
+        grid.origin = (0.0, -cy * voxel_mm, -cz * voxel_mm)
+    else:
+        grid.origin = (0.0, 0.0, 0.0)
+
+    # 1) wrzuć occupancy jako CELL data (voxele)
+    occ_cell = volume_bool.astype(np.uint8).ravel(order="F")  # X*Y*Z
+    grid.cell_data["occ_cell"] = occ_cell
+
+    # 2) przekonwertuj cell_data -> point_data (wymagane przez contour w PyVista)
+    #    "max" działa dobrze dla binarnego occupancy (jeśli jakakolwiek sąsiadująca komórka =1, punkt=1)
+    grid_pt = grid.cell_data_to_point_data(pass_cell_data=False)
+    # PyVista zwykle nazwie to tak samo jak cell array: "occ_cell"
+    # Dla pewności:
+    if "occ_cell" not in grid_pt.point_data:
+        raise RuntimeError("Nie znalazłem occ_cell w point_data po konwersji.")
+
+    # 3) contour na point_data
+    surf = grid_pt.contour(isosurfaces=[0.5], scalars="occ_cell")
+
+    if smooth_iters > 0 and surf.n_points > 0:
+        surf = surf.smooth(n_iter=smooth_iters)
+
+    p = pv.Plotter(title=title)
+    p.add_text(title, font_size=12)
+    p.add_mesh(surf, opacity=1.0)
+    p.add_axes()
+    p.show_grid()
+    p.show()
 
 
 # ==========================================
@@ -221,21 +310,8 @@ def center_crop_or_pad_width(img, target_w, pad_value=0):
                                   borderType=cv2.BORDER_CONSTANT, value=(pad_value, pad_value, pad_value))
 
 
-def alpha_blend_rgb(img1_rgb, img2_rgb, alpha=0.5):
-    img1f = img1_rgb.astype(np.float32)
-    img2f = img2_rgb.astype(np.float32)
-    out = img1f * alpha + img2f * (1.0 - alpha)
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
 # ==========================================
 # 3D: projekcje prostopadłe + przecięcie
-# Ustalamy osie:
-# - X: oś rurki (wzdłuż szerokości obrazu W)
-# - Y,Z: przekrój kołowy
-#
-# Widok Z GÓRY (tube1): obraz to X vs Z, a my wypełniamy chord w osi Y
-# Widok Z BOKU (tube2): obraz to X vs Y, a my wypełniamy chord w osi Z
 # ==========================================
 def _compute_grid_from_rect(H, W, diameter_mm, voxel_mm=None):
     mm_per_px = diameter_mm / float(H)
@@ -277,12 +353,14 @@ def project_mask_side_view_to_cylinder_volume(mask_side: np.ndarray, diameter_mm
     y_vox = np.round(y_mm / voxel_mm).astype(int) + cy
     y_vox = np.clip(y_vox, 0, YZ - 1)
 
+    R2 = (YZ // 2) ** 2
+
     for i in range(xs.size):
         x_vox = x_map[xs[i]]
         yv = int(y_vox[i])
 
         dy = yv - cy
-        inside = (YZ // 2) ** 2 - dy * dy
+        inside = R2 - dy * dy
         if inside <= 0:
             continue
         z_extent = int(np.floor(np.sqrt(inside)))
@@ -324,12 +402,14 @@ def project_mask_top_view_to_cylinder_volume(mask_top: np.ndarray, diameter_mm: 
     z_vox = np.round(z_mm / voxel_mm).astype(int) + cz
     z_vox = np.clip(z_vox, 0, YZ - 1)
 
+    R2 = (YZ // 2) ** 2
+
     for i in range(xs.size):
         x_vox = x_map[xs[i]]
         zv = int(z_vox[i])
 
         dz = zv - cz
-        inside = (YZ // 2) ** 2 - dz * dz
+        inside = R2 - dz * dz
         if inside <= 0:
             continue
         y_extent = int(np.floor(np.sqrt(inside)))
@@ -346,35 +426,6 @@ def project_mask_top_view_to_cylinder_volume(mask_top: np.ndarray, diameter_mm: 
         vol[x_vox, y0:y1 + 1, zv] = True
 
     return vol, mm_per_px, voxel_mm
-
-
-def show_3d_volume_scatter(volume_bool: np.ndarray, title: str, max_points: int = 120000):
-    pts = np.argwhere(volume_bool)
-    if pts.shape[0] == 0:
-        print("Brak punktów w objętości (volume jest puste).")
-        return
-
-    if pts.shape[0] > max_points:
-        idx = np.random.choice(pts.shape[0], size=max_points, replace=False)
-        pts = pts[idx]
-
-    x = pts[:, 0]
-    y = pts[:, 1]
-    z = pts[:, 2]
-
-    fig = plt.figure(figsize=(8, 7))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.scatter(x, y, z, s=1)
-    ax.set_title(title)
-    ax.set_xlabel("X (oś rurki)")
-    ax.set_ylabel("Y (przekrój)")
-    ax.set_zlabel("Z (przekrój)")
-    plt.tight_layout()
-
-    plt.show(block=False)
-    plt.pause(0.001)
-    plt.waitforbuttonpress()
-    plt.close(fig)
 
 
 # ==========================================
@@ -463,9 +514,7 @@ def main(dataset_dir="bubble.coco/train",
     rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
     h, w = gray.shape
 
-    # ==========================================
-    # 4 RURKI: tube1 = widok z góry, tube2 = widok z boku (tej samej fizycznej rurki)
-    # ==========================================
+    # 4 RURKI: tube1 = widok z góry, tube2 = widok z boku
     tubes = [
         {"a_top": 0.007, "b_top": 50,  "a_bot": 0.007, "b_bot": 100},   # tube 1 (TOP VIEW)
         {"a_top": 0.019, "b_top": 105, "a_bot": 0.019, "b_bot": 155},   # tube 2 (SIDE VIEW)
@@ -473,11 +522,8 @@ def main(dataset_dir="bubble.coco/train",
         {"a_top": 0.005, "b_top": 408, "a_bot": 0.005, "b_bot": 470},
     ]
 
-    # przypisywanie bąbli do rurek
     MARGIN_PX = 2.0
-    # wycinanie "do środka"
     INNER_MARGIN_PX = 2.0
-
     X_LEFT = 0
     X_RIGHT = w - 1
     KEEP_ASPECT = True
@@ -524,16 +570,12 @@ def main(dataset_dir="bubble.coco/train",
     show_step(vis2, "KROK 2: Bąble przypisane do rurek")
     print("Liczba bąbli w rurkach:", [len(tube_anns[i]) for i in range(4)])
 
-    # ============================================================
-    # KROK 3: ZRÓB DWIE MASKI (tube1 i tube2) i przepuść przez TEN SAM pipeline geometrii
-    #         (wytnij po liniach -> wyprostuj -> skaluj do wyższej -> dopasuj szerokość)
-    # ============================================================
-    mask1_orig = build_bubble_mask_from_anns(tube_anns[0], h, w)  # tube1 (top view)
-    mask2_orig = build_bubble_mask_from_anns(tube_anns[1], h, w)  # tube2 (side view)
+    # ===== KROK 3: maski TOP i SIDE przez ten sam pipeline geometrii =====
+    mask1_orig = build_bubble_mask_from_anns(tube_anns[0], h, w)  # TOP
+    mask2_orig = build_bubble_mask_from_anns(tube_anns[1], h, w)  # SIDE
 
     view1 = overlay_mask(rgb, mask1_orig, color=(255, 0, 255), alpha=0.55)
     view2 = overlay_mask(rgb, mask2_orig, color=(0, 255, 255), alpha=0.55)
-
     show_step(view1, "KROK 3A: tube1 (TOP) maska bąbli na oryginale")
     show_step(view2, "KROK 3B: tube2 (SIDE) maska bąbli na oryginale")
 
@@ -552,13 +594,13 @@ def main(dataset_dir="bubble.coco/train",
     rect1_s = resize_to_match_height(rect1_mask, H_target, keep_aspect=KEEP_ASPECT, is_mask=True)
     rect2_s = resize_to_match_height(rect2_mask, H_target, keep_aspect=KEEP_ASPECT, is_mask=True)
 
-    # Dopasuj szerokość do wspólnej (min) bez dodatkowego rozciągania
+    # Dopasuj szerokość do wspólnej (min)
     W_target = min(rect1_s.shape[1], rect2_s.shape[1])
     rect1_s = center_crop_or_pad_width(rect1_s, W_target, pad_value=0)
     rect2_s = center_crop_or_pad_width(rect2_s, W_target, pad_value=0)
 
-    show_step(rect1_s, "KROK 3C: maska TOP po pipeline (wycięcie+wyprost+skalowanie)", cmap="gray")
-    show_step(rect2_s, "KROK 3D: maska SIDE po pipeline (wycięcie+wyprost+skalowanie)", cmap="gray")
+    show_step(rect1_s, "KROK 3C: maska TOP po pipeline", cmap="gray")
+    show_step(rect2_s, "KROK 3D: maska SIDE po pipeline", cmap="gray")
 
     # Debug: równoległoboki na oryginale
     dbg = rgb.copy()
@@ -566,9 +608,7 @@ def main(dataset_dir="bubble.coco/train",
     cv2.polylines(dbg, [quad2.astype(np.int32)], True, (0, 255, 255), 2)
     show_step(dbg, "DEBUG: Równoległoboki wycinania (magenta=TOP, cyan=SIDE)")
 
-    # ============================================================
-    # KROK 4: DWA RZUTY NA WALec (PROSTOPADŁE) + CZĘŚĆ WSPÓLNA
-    # ============================================================
+    # ===== KROK 4: DWA RZUTY NA WALEC + CZĘŚĆ WSPÓLNA =====
     vol_top, mm_per_px_top, voxel_mm_top = project_mask_top_view_to_cylinder_volume(
         rect1_s, diameter_mm=DIAMETER_MM, voxel_mm=VOXEL_MM, fill_full_chord=FILL_FULL_CHORD
     )
@@ -576,14 +616,13 @@ def main(dataset_dir="bubble.coco/train",
         rect2_s, diameter_mm=DIAMETER_MM, voxel_mm=voxel_mm_top, fill_full_chord=FILL_FULL_CHORD
     )
 
-    # Grid powinien wyjść taki sam (bo ten sam voxel_mm i ten sam W,H po pipeline)
+    # Ujednolicenie rozmiarów jeśli minimalnie różne
     if vol_top.shape != vol_side.shape:
-        # jeśli minimalnie różne przez zaokrąglenia, tnij do wspólnego minimalnego rozmiaru
-        X = min(vol_top.shape[0], vol_side.shape[0])
-        Y = min(vol_top.shape[1], vol_side.shape[1])
-        Z = min(vol_top.shape[2], vol_side.shape[2])
-        vol_top = vol_top[:X, :Y, :Z]
-        vol_side = vol_side[:X, :Y, :Z]
+        Xc = min(vol_top.shape[0], vol_side.shape[0])
+        Yc = min(vol_top.shape[1], vol_side.shape[1])
+        Zc = min(vol_top.shape[2], vol_side.shape[2])
+        vol_top = vol_top[:Xc, :Yc, :Zc]
+        vol_side = vol_side[:Xc, :Yc, :Zc]
 
     vol_intersection = np.logical_and(vol_top, vol_side)
 
@@ -593,13 +632,19 @@ def main(dataset_dir="bubble.coco/train",
     print(f"[3D] vol_side filled = {int(vol_side.sum())}")
     print(f"[3D] intersection filled = {int(vol_intersection.sum())}  <-- WYPADKOWY BĄBEL")
 
-    show_3d_volume_scatter(vol_intersection, "KROK 4: Część wspólna rzutów (wypadkowy bąbel)", max_points=120000)
+    # ===== KROK 4B: PyVista wizualizacja =====
+    # 1) szybka chmura punktów
+    pv_plot_pointcloud(vol_intersection, voxel_mm=voxel_mm_top, center_yz=True,
+                       max_points=500_000, point_size=3.0, title="Intersection - point cloud")
 
-    # ============================================================
-    # KROK 5: szybki export PLY (chmura punktów)
-    # ============================================================
+    # 2) ładna bryła (isosurface)
+    pv_plot_isosurface(vol_intersection, voxel_mm=voxel_mm_top, center_yz=True,
+                       smooth_iters=20, title="Intersection - isosurface")
+
+    # ===== KROK 5: export PLY (chmura punktów) =====
     out_ply = "bubble_intersection.ply"
-    export_volume_to_ply_pointcloud(vol_intersection, out_ply, voxel_mm=voxel_mm_top, center_yz=True, max_points=1_000_000)
+    export_volume_to_ply_pointcloud(vol_intersection, out_ply, voxel_mm=voxel_mm_top,
+                                    center_yz=True, max_points=1_000_000)
 
 
 if __name__ == "__main__":
