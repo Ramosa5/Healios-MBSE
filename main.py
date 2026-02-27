@@ -1,123 +1,30 @@
+# ============================================================
+# Bubble 3D reconstruction (NO STICKING, NO CENTER STRIP, LESS TAILS)
+# - per-bubble reconstruction (connected components + matching by X overlap)
+# - NO interpolation across gaps (fill only inside valid segments)
+# - robust column profile (percentiles instead of min/max) -> fewer "tails"
+# - live preview: animates, then keeps LAST FRAME until you close the window
+# - start_frame (1-based) to choose where to start in sorted file_name list
+# ============================================================
+
 import json
 import os
 import cv2
-import numpy as np
 import matplotlib.pyplot as plt
+import time
+import numpy as np
 import pyvista as pv
 
-
-# =========================
-# PyVista helpers
-# =========================
-def _volume_to_points_mm(volume_bool: np.ndarray, voxel_mm: float, center_yz: bool = True,
-                         max_points: int = 500_000):
-    pts = np.argwhere(volume_bool)  # (x,y,z) voxel indices
-    if pts.size == 0:
-        return None
-
-    if pts.shape[0] > max_points:
-        idx = np.random.choice(pts.shape[0], max_points, replace=False)
-        pts = pts[idx]
-
-    X, Y, Z = volume_bool.shape
-    cy = (Y - 1) / 2.0
-    cz = (Z - 1) / 2.0
-
-    xs = pts[:, 0].astype(np.float32) * voxel_mm
-    ys = pts[:, 1].astype(np.float32)
-    zs = pts[:, 2].astype(np.float32)
-
-    if center_yz:
-        ys = (ys - cy) * voxel_mm
-        zs = (zs - cz) * voxel_mm
-    else:
-        ys = ys * voxel_mm
-        zs = zs * voxel_mm
-
-    return np.c_[xs, ys, zs]
-
-
-def pv_plot_two_pointclouds_side_by_side(vol_a: np.ndarray, vol_b: np.ndarray, voxel_mm: float,
-                                        center_yz: bool = True, max_points: int = 500_000,
-                                        point_size: float = 3.0,
-                                        title_a: str = "Intersection 1-2",
-                                        title_b: str = "Intersection 3-4"):
-    pts_a = _volume_to_points_mm(vol_a, voxel_mm, center_yz=center_yz, max_points=max_points)
-    pts_b = _volume_to_points_mm(vol_b, voxel_mm, center_yz=center_yz, max_points=max_points)
-
-    p = pv.Plotter(shape=(1, 2), window_size=(1400, 700), title="Intersections (side-by-side)")
-
-    # left
-    p.subplot(0, 0)
-    p.add_text(title_a, font_size=12)
-    if pts_a is None:
-        p.add_text("EMPTY", font_size=18, position="upper_left")
-    else:
-        cloud_a = pv.PolyData(pts_a)
-        p.add_points(cloud_a, render_points_as_spheres=True, point_size=point_size)
-    p.add_axes()
-    p.show_grid()
-
-    # right
-    p.subplot(0, 1)
-    p.add_text(title_b, font_size=12)
-    if pts_b is None:
-        p.add_text("EMPTY", font_size=18, position="upper_left")
-    else:
-        cloud_b = pv.PolyData(pts_b)
-        p.add_points(cloud_b, render_points_as_spheres=True, point_size=point_size)
-    p.add_axes()
-    p.show_grid()
-
-    p.link_views()
-    p.show()
-
-
-def pv_plot_isosurface(volume_bool: np.ndarray, voxel_mm: float, center_yz: bool = True,
-                       smooth_iters: int = 0, title="Isosurface"):
-    if volume_bool.ndim != 3:
-        raise ValueError("volume_bool musi być 3D")
-    if volume_bool.sum() == 0:
-        print("[PyVista] volume pusty.")
-        return
-
-    X, Y, Z = volume_bool.shape
-
-    grid = pv.ImageData()
-    grid.dimensions = (X + 1, Y + 1, Z + 1)  # points
-    grid.spacing = (voxel_mm, voxel_mm, voxel_mm)
-
-    if center_yz:
-        cy = (Y - 1) / 2.0
-        cz = (Z - 1) / 2.0
-        grid.origin = (0.0, -cy * voxel_mm, -cz * voxel_mm)
-    else:
-        grid.origin = (0.0, 0.0, 0.0)
-
-    # cell occupancy
-    occ_cell = volume_bool.astype(np.uint8).ravel(order="F")  # X*Y*Z
-    grid.cell_data["occ_cell"] = occ_cell
-
-    # cell -> point (required for contour)
-    grid_pt = grid.cell_data_to_point_data(pass_cell_data=False)
-    if "occ_cell" not in grid_pt.point_data:
-        raise RuntimeError("Nie znalazłem occ_cell w point_data po konwersji.")
-
-    surf = grid_pt.contour(isosurfaces=[0.5], scalars="occ_cell")
-
-    if smooth_iters > 0 and surf.n_points > 0:
-        surf = surf.smooth(n_iter=smooth_iters)
-
-    p = pv.Plotter(title=title, window_size=(900, 800))
-    p.add_text(title, font_size=12)
-    p.add_mesh(surf, opacity=1.0)
-    p.add_axes()
-    p.show_grid()
-    p.show()
+# (optional) SciPy smoothing
+try:
+    from scipy.ndimage import gaussian_filter1d
+    HAS_SCIPY = True
+except Exception:
+    HAS_SCIPY = False
 
 
 # ==========================================
-# STABILNA WIZUALIZACJA (bez znikania okien)
+# STABILNA WIZUALIZACJA (zakomentowana)
 # ==========================================
 def show_step(img, title="", cmap=None):
     fig, ax = plt.subplots(figsize=(7, 7))
@@ -125,7 +32,6 @@ def show_step(img, title="", cmap=None):
     ax.set_title(title)
     ax.axis("off")
     plt.tight_layout()
-
     plt.show(block=False)
     plt.pause(0.001)
     plt.waitforbuttonpress()
@@ -146,10 +52,8 @@ def load_coco(path):
 # ==========================================
 def ann_to_mask(ann, img_h, img_w):
     mask = np.zeros((img_h, img_w), dtype=np.uint8)
-
     seg = ann.get("segmentation", None)
 
-    # --- POLYGON ---
     if isinstance(seg, list) and len(seg) > 0:
         for poly in seg:
             pts = np.array(poly, dtype=np.float32).reshape(-1, 2)
@@ -157,18 +61,15 @@ def ann_to_mask(ann, img_h, img_w):
             cv2.fillPoly(mask, [pts], 255)
         return mask
 
-    # --- BBOX fallback ---
     bbox = ann.get("bbox", None)
     if bbox is None or len(bbox) != 4:
         return mask
 
     x, y, w, h = map(float, bbox)
-
     x0 = max(0, int(round(x)))
     y0 = max(0, int(round(y)))
     x1 = min(img_w, int(round(x + w)))
     y1 = min(img_h, int(round(y + h)))
-
     cv2.rectangle(mask, (x0, y0), (x1, y1), 255, -1)
     return mask
 
@@ -190,10 +91,8 @@ def draw_tubes(rgb, tubes):
 
     for i, t in enumerate(tubes):
         x0, x1 = 0, w - 1
-
         y0_top = int(round(t["a_top"] * x0 + t["b_top"]))
         y1_top = int(round(t["a_top"] * x1 + t["b_top"]))
-
         y0_bot = int(round(t["a_bot"] * x0 + t["b_bot"]))
         y1_bot = int(round(t["a_bot"] * x1 + t["b_bot"]))
 
@@ -203,7 +102,6 @@ def draw_tubes(rgb, tubes):
         y_mid = int((y0_top + y0_bot) / 2)
         cv2.putText(out, f"tube {i+1}", (10, max(20, y_mid)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
     return out
 
 
@@ -235,7 +133,6 @@ def _tube_quad_points(tube: dict, x_left: float, x_right: float, margin_px: floa
     y_bl = a_bot * x_left + b_bot - margin_px
     y_br = a_bot * x_right + b_bot - margin_px
 
-    # upewnij się, że top jest nad bottom
     if y_bl < y_tl:
         y_tl, y_bl = y_bl, y_tl
     if y_br < y_tr:
@@ -271,10 +168,10 @@ def crop_and_rectify_tube(img, tube: dict, x_left: int, x_right: int,
         out_w = int(out_width)
 
     dst = np.array([
-        [0,        0],
+        [0,         0],
         [out_w - 1, 0],
         [out_w - 1, out_h - 1],
-        [0,        out_h - 1],
+        [0,         out_h - 1],
     ], dtype=np.float32)
 
     M = cv2.getPerspectiveTransform(src, dst)
@@ -284,7 +181,6 @@ def crop_and_rectify_tube(img, tube: dict, x_left: int, x_right: int,
 
     rect = cv2.warpPerspective(img, M, (out_w, out_h),
                                flags=interp, borderMode=border, borderValue=border_val)
-
     return rect, src
 
 
@@ -332,168 +228,262 @@ def center_crop_or_pad_width(img, target_w, pad_value=0):
                                   borderType=cv2.BORDER_CONSTANT, value=(pad_value, pad_value, pad_value))
 
 
+def rectify_and_align_pair(mask_top_orig: np.ndarray, tube_top: dict,
+                           mask_side_orig: np.ndarray, tube_side: dict,
+                           x_left: int, x_right: int, inner_margin_px: float,
+                           keep_aspect: bool):
+    rect_top, quad_top = crop_and_rectify_tube(
+        mask_top_orig, tube_top, x_left=x_left, x_right=x_right,
+        inner_margin_px=inner_margin_px, interp=cv2.INTER_NEAREST
+    )
+    rect_side, quad_side = crop_and_rectify_tube(
+        mask_side_orig, tube_side, x_left=x_left, x_right=x_right,
+        inner_margin_px=inner_margin_px, interp=cv2.INTER_NEAREST
+    )
+
+    H_target = max(rect_top.shape[0], rect_side.shape[0])
+    rect_top = resize_to_match_height(rect_top, H_target, keep_aspect=keep_aspect, is_mask=True)
+    rect_side = resize_to_match_height(rect_side, H_target, keep_aspect=keep_aspect, is_mask=True)
+
+    W_target = min(rect_top.shape[1], rect_side.shape[1])
+    rect_top = center_crop_or_pad_width(rect_top, W_target, pad_value=0)
+    rect_side = center_crop_or_pad_width(rect_side, W_target, pad_value=0)
+
+    return rect_top, rect_side, quad_top, quad_side
+
+
 # ==========================================
-# 3D: projekcje prostopadłe + przecięcie
+# CONNECTED COMPONENTS + MATCHING BY X-OVERLAP
+# (rekonstrukcja per-bąbel, brak sklejania)
 # ==========================================
-def _compute_grid_from_rect(H, W, diameter_mm, voxel_mm=None):
+def connected_components(mask_2d: np.ndarray, min_area: int = 80):
+    m = (mask_2d > 0).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    comps = []
+    for i in range(1, num):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        comp = (labels == i).astype(np.uint8) * 255
+        comps.append(comp)
+    return comps
+
+
+def x_span(mask_2d: np.ndarray):
+    xs = np.where(mask_2d.max(axis=0) > 0)[0]
+    if xs.size == 0:
+        return None
+    return int(xs.min()), int(xs.max())
+
+
+def span_iou(a, b):
+    if a is None or b is None:
+        return 0.0
+    ax0, ax1 = a
+    bx0, bx1 = b
+    inter = max(0, min(ax1, bx1) - max(ax0, bx0) + 1)
+    union = (ax1 - ax0 + 1) + (bx1 - bx0 + 1) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def match_components_by_x(top_comps, side_comps, iou_thr=0.15):
+    top_spans = [x_span(c) for c in top_comps]
+    side_spans = [x_span(c) for c in side_comps]
+
+    pairs = []
+    used_side = set()
+    for i, ts in enumerate(top_spans):
+        best_j = -1
+        best_iou = 0.0
+        for j, ss in enumerate(side_spans):
+            if j in used_side:
+                continue
+            iou = span_iou(ts, ss)
+            if iou > best_iou:
+                best_iou = iou
+                best_j = j
+        if best_j >= 0 and best_iou >= iou_thr:
+            used_side.add(best_j)
+            pairs.append((top_comps[i], side_comps[best_j], best_iou))
+    return pairs
+
+
+# ============================================================
+# Interpolacja TYLKO w obrębie ciągłych segmentów valid
+# (usuwa pasek przez środek rurki / mostkowanie dziur)
+# ============================================================
+def _segments_from_valid(valid: np.ndarray, min_len: int = 3):
+    segs = []
+    n = valid.size
+    i = 0
+    while i < n:
+        if not valid[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and valid[j]:
+            j += 1
+        if (j - i) >= min_len:
+            segs.append((i, j))
+        i = j
+    return segs
+
+
+def _fill_missing_1d_within_segments(arr: np.ndarray, valid: np.ndarray):
+    out = arr.astype(np.float32).copy()
+    x = np.arange(arr.size)
+
+    segs = _segments_from_valid(valid, min_len=2)
+    for l, r in segs:
+        v = valid[l:r]
+        if v.sum() == 0:
+            continue
+        xx = x[l:r]
+        yy = out[l:r]
+        yy[~v] = np.interp(xx[~v], xx[v], yy[v])
+        out[l:r] = yy
+    return out
+
+
+# ============================================================
+# build 3D volume from TWO silhouettes using ELLIPTIC cross-sections
+# - robust profile (percentiles) => mniej ogonów
+# - fill only within valid segments => brak paska
+# ============================================================
+def _profile_from_mask_columns(mask_2d: np.ndarray, p_lo=5, p_hi=95):
+    """
+    mask_2d: uint8 [H,W], rows=vertical axis
+    returns: center[W], half[W], valid[W]
+    robust: uses percentiles instead of min/max (less tails)
+    """
+    H, W = mask_2d.shape
+    center = np.zeros(W, dtype=np.float32)
+    half = np.zeros(W, dtype=np.float32)
+    valid = np.zeros(W, dtype=bool)
+
+    for x in range(W):
+        ys = np.where(mask_2d[:, x] > 0)[0]
+        if ys.size == 0:
+            center[x] = (H - 1) / 2.0
+            half[x] = 0.0
+            valid[x] = False
+            continue
+
+        # robust bounds
+        y0 = int(np.percentile(ys, p_lo))
+        y1 = int(np.percentile(ys, p_hi))
+        if y1 < y0:
+            y0, y1 = y1, y0
+
+        center[x] = 0.5 * (y0 + y1)
+        half[x] = 0.5 * (y1 - y0)
+        valid[x] = True
+
+    return center, half, valid
+
+
+def build_volume_elliptic_from_two_masks(mask_top_xz: np.ndarray,
+                                        mask_side_xy: np.ndarray,
+                                        diameter_mm: float,
+                                        voxel_mm: float = None,
+                                        smooth_sigma_x: float = 2.0,
+                                        min_radius_vox: float = 0.8):
+    if mask_top_xz.ndim != 2 or mask_side_xy.ndim != 2:
+        raise ValueError("maski muszą być 2D")
+    H, W = mask_top_xz.shape
+    if mask_side_xy.shape != (H, W):
+        raise ValueError("mask_top i mask_side muszą mieć ten sam rozmiar po pipeline")
+
     mm_per_px = diameter_mm / float(H)
     if voxel_mm is None:
         voxel_mm = mm_per_px
 
     R_vox = int(round((diameter_mm / 2.0) / voxel_mm))
     YZ = 2 * R_vox + 1
-
-    length_mm = W * mm_per_px
-    X = max(1, int(round(length_mm / voxel_mm)))
-
+    X = max(1, int(round((W * mm_per_px) / voxel_mm)))
     x_map = np.linspace(0, X - 1, W).round().astype(int)
+
     cy = R_vox
     cz = R_vox
-    return X, YZ, cy, cz, x_map, mm_per_px, voxel_mm
 
+    # TOP -> Z profile (rows are Z)
+    zc_px, zhalf_px, zvalid = _profile_from_mask_columns(mask_top_xz)
+    # SIDE -> Y profile (rows are Y)
+    yc_px, yhalf_px, yvalid = _profile_from_mask_columns(mask_side_xy)
 
-def project_mask_side_view_to_cylinder_volume(mask_side: np.ndarray, diameter_mm: float,
-                                             voxel_mm: float = None,
-                                             fill_full_chord: bool = True):
-    if mask_side.ndim != 2:
-        raise ValueError("mask_side musi być 2D.")
-    H, W = mask_side.shape
+    valid_both = zvalid & yvalid
 
-    X, YZ, cy, cz, x_map, mm_per_px, voxel_mm = _compute_grid_from_rect(H, W, diameter_mm, voxel_mm)
+    # Fill only INSIDE valid segments (no bridging between bubbles)
+    zc_px    = _fill_missing_1d_within_segments(zc_px, valid_both)
+    yc_px    = _fill_missing_1d_within_segments(yc_px, valid_both)
+    zhalf_px = _fill_missing_1d_within_segments(zhalf_px, valid_both)
+    yhalf_px = _fill_missing_1d_within_segments(yhalf_px, valid_both)
+
+    # Critical: outside valid -> radii 0 => no fill => no center strip
+    zhalf_px[~valid_both] = 0.0
+    yhalf_px[~valid_both] = 0.0
+
+    px_center = (H - 1) / 2.0
+    z0_mm = (zc_px - px_center) * mm_per_px
+    y0_mm = (yc_px - px_center) * mm_per_px
+
+    z0_vox = np.round(z0_mm / voxel_mm).astype(np.int32) + cz
+    y0_vox = np.round(y0_mm / voxel_mm).astype(np.int32) + cy
+
+    b_vox = np.maximum(0.0, (zhalf_px * mm_per_px) / voxel_mm).astype(np.float32)  # Z semi-axis
+    a_vox = np.maximum(0.0, (yhalf_px * mm_per_px) / voxel_mm).astype(np.float32)  # Y semi-axis
+
+    # Smooth only where we have data; simplest: smooth whole arrays but radii are 0 outside valid
+    if smooth_sigma_x and smooth_sigma_x > 0:
+        if HAS_SCIPY:
+            a_vox = gaussian_filter1d(a_vox, sigma=smooth_sigma_x).astype(np.float32)
+            b_vox = gaussian_filter1d(b_vox, sigma=smooth_sigma_x).astype(np.float32)
+            y0_vox = np.round(gaussian_filter1d(y0_vox.astype(np.float32), sigma=smooth_sigma_x)).astype(np.int32)
+            z0_vox = np.round(gaussian_filter1d(z0_vox.astype(np.float32), sigma=smooth_sigma_x)).astype(np.int32)
+        else:
+            k = int(max(3, 2 * round(smooth_sigma_x) + 1))
+            k = k if (k % 2 == 1) else k + 1
+            ker = np.ones(k, dtype=np.float32) / k
+            a_vox = np.convolve(a_vox, ker, mode="same").astype(np.float32)
+            b_vox = np.convolve(b_vox, ker, mode="same").astype(np.float32)
+
+    # apply min radius only where we have non-zero after smoothing
+    a_vox = np.where(a_vox > 0.0, np.maximum(a_vox, min_radius_vox), 0.0).astype(np.float32)
+    b_vox = np.where(b_vox > 0.0, np.maximum(b_vox, min_radius_vox), 0.0).astype(np.float32)
+
     vol = np.zeros((X, YZ, YZ), dtype=bool)
 
-    ys, xs = np.where(mask_side > 0)
-    if ys.size == 0:
-        return vol, mm_per_px, voxel_mm
+    yy, zz = np.meshgrid(np.arange(YZ), np.arange(YZ), indexing="ij")
+    circle = ((yy - cy) ** 2 + (zz - cz) ** 2) <= (R_vox ** 2)
 
-    y_center_px = (H - 1) / 2.0
-    y_mm = (ys - y_center_px) * mm_per_px
-    y_vox = np.round(y_mm / voxel_mm).astype(int) + cy
-    y_vox = np.clip(y_vox, 0, YZ - 1)
-
-    R2 = (YZ // 2) ** 2
-
-    for i in range(xs.size):
-        x_vox = x_map[xs[i]]
-        yv = int(y_vox[i])
-
-        dy = yv - cy
-        inside = R2 - dy * dy
-        if inside <= 0:
+    for x_px in range(W):
+        # if no object here -> skip
+        if a_vox[x_px] <= 0.0 or b_vox[x_px] <= 0.0:
             continue
-        z_extent = int(np.floor(np.sqrt(inside)))
 
-        if fill_full_chord:
-            z0 = cz - z_extent
-            z1 = cz + z_extent
-        else:
-            z0 = cz
-            z1 = cz + z_extent
+        xv = int(x_map[x_px])
 
-        z0 = max(0, z0)
-        z1 = min(YZ - 1, z1)
-        vol[x_vox, yv, z0:z1 + 1] = True
+        y0 = int(np.clip(y0_vox[x_px], 0, YZ - 1))
+        z0 = int(np.clip(z0_vox[x_px], 0, YZ - 1))
+
+        a = float(a_vox[x_px])
+        b = float(b_vox[x_px])
+
+        ell = (((yy - y0) / a) ** 2 + ((zz - z0) / b) ** 2) <= 1.0
+        vol[xv] = circle & ell
 
     return vol, mm_per_px, voxel_mm
 
 
-def project_mask_top_view_to_cylinder_volume(mask_top: np.ndarray, diameter_mm: float,
-                                            voxel_mm: float = None,
-                                            fill_full_chord: bool = True):
-    if mask_top.ndim != 2:
-        raise ValueError("mask_top musi być 2D.")
-    H, W = mask_top.shape
-
-    X, YZ, cy, cz, x_map, mm_per_px, voxel_mm = _compute_grid_from_rect(H, W, diameter_mm, voxel_mm)
-    vol = np.zeros((X, YZ, YZ), dtype=bool)
-
-    zs, xs = np.where(mask_top > 0)
-    if zs.size == 0:
-        return vol, mm_per_px, voxel_mm
-
-    z_center_px = (H - 1) / 2.0
-    z_mm = (zs - z_center_px) * mm_per_px
-    z_vox = np.round(z_mm / voxel_mm).astype(int) + cz
-    z_vox = np.clip(z_vox, 0, YZ - 1)
-
-    R2 = (YZ // 2) ** 2
-
-    for i in range(xs.size):
-        x_vox = x_map[xs[i]]
-        zv = int(z_vox[i])
-
-        dz = zv - cz
-        inside = R2 - dz * dz
-        if inside <= 0:
-            continue
-        y_extent = int(np.floor(np.sqrt(inside)))
-
-        if fill_full_chord:
-            y0 = cy - y_extent
-            y1 = cy + y_extent
-        else:
-            y0 = cy
-            y1 = cy + y_extent
-
-        y0 = max(0, y0)
-        y1 = min(YZ - 1, y1)
-        vol[x_vox, y0:y1 + 1, zv] = True
-
-    return vol, mm_per_px, voxel_mm
-
-
-def _rectify_and_align_pair(mask_a_orig: np.ndarray, tube_a: dict,
-                            mask_b_orig: np.ndarray, tube_b: dict,
-                            x_left: int, x_right: int, inner_margin_px: float,
-                            keep_aspect: bool):
-    rect_a, quad_a = crop_and_rectify_tube(
-        mask_a_orig, tube_a, x_left=x_left, x_right=x_right,
-        inner_margin_px=inner_margin_px, interp=cv2.INTER_NEAREST
-    )
-    rect_b, quad_b = crop_and_rectify_tube(
-        mask_b_orig, tube_b, x_left=x_left, x_right=x_right,
-        inner_margin_px=inner_margin_px, interp=cv2.INTER_NEAREST
-    )
-
-    H_target = max(rect_a.shape[0], rect_b.shape[0])
-    rect_a = resize_to_match_height(rect_a, H_target, keep_aspect=keep_aspect, is_mask=True)
-    rect_b = resize_to_match_height(rect_b, H_target, keep_aspect=keep_aspect, is_mask=True)
-
-    W_target = min(rect_a.shape[1], rect_b.shape[1])
-    rect_a = center_crop_or_pad_width(rect_a, W_target, pad_value=0)
-    rect_b = center_crop_or_pad_width(rect_b, W_target, pad_value=0)
-
-    return rect_a, rect_b, quad_a, quad_b
-
-
-def _unify_shapes(vol_a: np.ndarray, vol_b: np.ndarray):
-    if vol_a.shape == vol_b.shape:
-        return vol_a, vol_b
-    Xc = min(vol_a.shape[0], vol_b.shape[0])
-    Yc = min(vol_a.shape[1], vol_b.shape[1])
-    Zc = min(vol_a.shape[2], vol_b.shape[2])
-    return vol_a[:Xc, :Yc, :Zc], vol_b[:Xc, :Yc, :Zc]
-
-
-# ==========================================
-# EXPORT: szybki PLY (point cloud z voxeli)
-# ==========================================
-def export_volume_to_ply_pointcloud(volume_bool: np.ndarray,
-                                    out_path: str,
-                                    voxel_mm: float,
-                                    center_yz: bool = True,
-                                    max_points: int = 1_000_000):
+def volume_to_points_mm(volume_bool: np.ndarray, voxel_mm: float, center_yz: bool = True,
+                        max_points: int = 500_000):
     pts = np.argwhere(volume_bool)
-    n = pts.shape[0]
-    if n == 0:
-        print("[PLY] volume pusty, nic nie zapisuję.")
-        return
+    if pts.size == 0:
+        return None
 
-    if n > max_points:
-        idx = np.random.choice(n, size=max_points, replace=False)
+    if pts.shape[0] > max_points:
+        idx = np.random.choice(pts.shape[0], max_points, replace=False)
         pts = pts[idx]
-        n = pts.shape[0]
-        print(f"[PLY] Ograniczam liczbę punktów do {n} (losowanie).")
 
     X, Y, Z = volume_bool.shape
     cy = (Y - 1) / 2.0
@@ -510,29 +500,154 @@ def export_volume_to_ply_pointcloud(volume_bool: np.ndarray,
         ys = ys * voxel_mm
         zs = zs * voxel_mm
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("ply\n")
-        f.write("format ascii 1.0\n")
-        f.write(f"element vertex {n}\n")
-        f.write("property float x\n")
-        f.write("property float y\n")
-        f.write("property float z\n")
-        f.write("end_header\n")
-        for i in range(n):
-            f.write(f"{xs[i]:.6f} {ys[i]:.6f} {zs[i]:.6f}\n")
-
-    print(f"[PLY] Zapisano: {out_path} (punkty: {n})")
+    return np.c_[xs, ys, zs]
 
 
 # ==========================================
-# MAIN
+# PyVista: live animacja + zostaw ostatnią klatkę
+# ==========================================
+def pv_live_animate_keep_last(frames_data,
+                              center_yz: bool = True,
+                              max_points: int = 200_000,
+                              point_size: float = 3.0,
+                              pause_s: float = 0.05,
+                              zoom_out: float = 1.8):
+    def safe_pts(vol, vox):
+        pts = volume_to_points_mm(vol, vox, center_yz=center_yz, max_points=max_points)
+        if pts is None:
+            return np.empty((0, 3), dtype=np.float32)
+        return pts.astype(np.float32, copy=False)
+
+    p = pv.Plotter(shape=(1, 2), window_size=(1500, 720), off_screen=False, title="Bubbles (live)")
+
+    fd0 = frames_data[0]
+    poly_a = pv.PolyData(safe_pts(fd0["vol_12"], fd0["vox_12"]))
+    poly_b = pv.PolyData(safe_pts(fd0["vol_34"], fd0["vox_34"]))
+
+    p.subplot(0, 0)
+    p.add_text("Bubble 3D (tube1&2)", font_size=12)
+    p.add_points(poly_a, render_points_as_spheres=True, point_size=point_size)
+    p.add_axes()
+    p.show_grid()
+
+    p.subplot(0, 1)
+    p.add_text("Bubble 3D (tube3&4)", font_size=12)
+    p.add_points(poly_b, render_points_as_spheres=True, point_size=point_size)
+    p.add_axes()
+    p.show_grid()
+
+    p.link_views()
+
+    # --- AUTO CAMERA: oddal widok zanim zacznie się animacja ---
+    p.reset_camera()
+
+    # twarde oddalenie (distance)
+    try:
+        p.camera.distance = float(p.camera.distance) * float(zoom_out)
+    except Exception:
+        pass
+
+    # dodatkowe "zoom out" (mniej niż 1 oddala)
+    try:
+        p.camera.zoom(1.0 / float(zoom_out))
+    except Exception:
+        pass
+
+    try:
+        p.show(auto_close=False, interactive_update=True)
+    except TypeError:
+        # fallback: cannot animate live in this version -> just show first frame blocking
+        p.show(auto_close=True)
+        return
+
+    for fd in frames_data:
+        poly_a.points = safe_pts(fd["vol_12"], fd["vox_12"])
+        poly_b.points = safe_pts(fd["vol_34"], fd["vox_34"])
+
+        (poly_a.modified() if hasattr(poly_a, "modified") else poly_a.Modified())
+        (poly_b.modified() if hasattr(poly_b, "modified") else poly_b.Modified())
+
+        try:
+            p.title = fd["title"]
+        except Exception:
+            pass
+
+        p.render()
+        if hasattr(p, "process_events"):
+            p.process_events()
+        time.sleep(pause_s)
+
+    # NOW keep last frame until window is closed:
+    # This call blocks and keeps the current scene (last frame).
+    p.show(auto_close=True)
+
+
+# ==========================================
+# Per-pair reconstruction WITHOUT STICKING
+# - connected components in rectified masks
+# - match TOP<->SIDE components by X overlap
+# - reconstruct each bubble separately, OR volumes
+# ==========================================
+def reconstruct_pair_no_stick(rect_top: np.ndarray,
+                              rect_side: np.ndarray,
+                              diameter_mm: float,
+                              voxel_mm: float,
+                              smooth_sigma_x: float,
+                              min_radius_vox: float,
+                              min_area_cc: int = 80,
+                              iou_thr: float = 0.15):
+    top_comps = connected_components(rect_top, min_area=min_area_cc)
+    side_comps = connected_components(rect_side, min_area=min_area_cc)
+
+    pairs = match_components_by_x(top_comps, side_comps, iou_thr=iou_thr)
+
+    vol_out = None
+    voxel_out = None
+
+    for mt, ms, iou in pairs:
+        v, _, vox = build_volume_elliptic_from_two_masks(
+            mt, ms,
+            diameter_mm=diameter_mm,
+            voxel_mm=voxel_mm,
+            smooth_sigma_x=smooth_sigma_x,
+            min_radius_vox=min_radius_vox
+        )
+        if vol_out is None:
+            vol_out = v
+            voxel_out = vox
+        else:
+            # ensure same shape (should be, because same H,W -> same vol dims)
+            if v.shape == vol_out.shape:
+                vol_out |= v
+            else:
+                # rare: shape mismatch due to rounding (very unlikely). pad to max.
+                X = max(vol_out.shape[0], v.shape[0])
+                Y = max(vol_out.shape[1], v.shape[1])
+                Z = max(vol_out.shape[2], v.shape[2])
+                vv = np.zeros((X, Y, Z), dtype=bool)
+                oo = np.zeros((X, Y, Z), dtype=bool)
+                oo[:vol_out.shape[0], :vol_out.shape[1], :vol_out.shape[2]] = vol_out
+                vv[:v.shape[0], :v.shape[1], :v.shape[2]] = v
+                vol_out = oo | vv
+                voxel_out = vox  # close enough
+
+    if vol_out is None:
+        # empty result
+        vol_out = np.zeros((1, 1, 1), dtype=bool)
+        voxel_out = (diameter_mm / float(rect_top.shape[0])) if rect_top.shape[0] > 0 else 1.0
+
+    return vol_out, voxel_out, len(pairs)
+
+
+# ==========================================
+# MAIN: wybór startu po numerze klatki (1-based)
 # ==========================================
 def main(dataset_dir="bubble.coco/train",
          coco_file="_annotations.coco.json",
-         image_number=60):
+         start_frame=1,
+         n_frames=40):
 
     coco = load_coco(os.path.join(dataset_dir, coco_file))
-
     images = coco["images"]
     annotations = coco["annotations"]
     categories = coco["categories"]
@@ -541,203 +656,144 @@ def main(dataset_dir="bubble.coco/train",
     for c in categories:
         if c["name"] == "bubble":
             bubble_cat_id = c["id"]
+            break
     if bubble_cat_id is None:
         raise RuntimeError("Nie znaleziono kategorii 'bubble'")
 
-    idx = image_number - 1
-    if idx < 0 or idx >= len(images):
-        raise RuntimeError("Nie ma tylu zdjęć w dataset")
+    images_sorted = sorted(images, key=lambda d: d.get("file_name", ""))
 
-    img_info = images[idx]
-    img_id = img_info["id"]
-    img_path = os.path.join(dataset_dir, img_info["file_name"])
+    start_idx = max(0, int(start_frame) - 1)  # 1-based -> 0-based
+    end_idx = min(len(images_sorted), start_idx + max(1, int(n_frames)))
+    images_sel = images_sorted[start_idx:end_idx]
 
-    print(f"Używam zdjęcia #{image_number}: {img_info['file_name']}")
+    print(f"Start frame (1-based) = {start_frame}  -> idx={start_idx}")
+    print(f"Biorę klatki: [{start_idx}:{end_idx}] z {len(images_sorted)} total")
+    if not images_sel:
+        raise RuntimeError("Zakres start_frame/n_frames poza listą obrazów")
 
-    gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    if gray is None:
-        raise RuntimeError("Nie mogę wczytać obrazu")
-
-    rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-    h, w = gray.shape
-
-    # 4 RURKI: (1,2) para pierwsza, (3,4) para druga
+    # tube1=TOP, tube2=SIDE, tube3=TOP, tube4=SIDE
     tubes = [
-        {"a_top": 0.007, "b_top": 50,  "a_bot": 0.007, "b_bot": 100},   # tube 1 (TOP VIEW)
-        {"a_top": 0.019, "b_top": 105, "a_bot": 0.019, "b_bot": 155},   # tube 2 (SIDE VIEW)
-        {"a_top": 0.005, "b_top": 322, "a_bot": 0.005, "b_bot": 380},   # tube 3 (TOP VIEW)
-        {"a_top": 0.005, "b_top": 408, "a_bot": 0.005, "b_bot": 470},   # tube 4 (SIDE VIEW)
+        {"a_top": 0.007, "b_top": 50,  "a_bot": 0.007, "b_bot": 100},
+        {"a_top": 0.019, "b_top": 105, "a_bot": 0.019, "b_bot": 155},
+        {"a_top": 0.005, "b_top": 322, "a_bot": 0.005, "b_bot": 380},
+        {"a_top": 0.005, "b_top": 408, "a_bot": 0.005, "b_bot": 470},
     ]
 
     MARGIN_PX = 2.0
     INNER_MARGIN_PX = 2.0
-    X_LEFT = 0
-    X_RIGHT = w - 1
     KEEP_ASPECT = True
 
-    # ===== 3D cylinder =====
     DIAMETER_MM = 20.0
-    VOXEL_MM = None
-    FILL_FULL_CHORD = True
+    VOXEL_MM = None  # None => voxel_mm = mm_per_px
+    SMOOTH_SIGMA_X = 2.0
+    MIN_RADIUS_VOX = 0.8
 
-    # ===== STEP 1: pokaż rurki =====
-    vis1 = draw_tubes(rgb, tubes)
-    show_step(vis1, "KROK 1: 4 rurki (linie ax+b)")
+    # per-bubble settings:
+    MIN_AREA_CC = 80
+    IOU_THR = 0.15
 
-    # ===== STEP 2: przypisz bąble do rurek =====
-    bubble_anns = [
-        a for a in annotations
-        if a["image_id"] == img_id and a["category_id"] == bubble_cat_id
-    ]
+    frames_data = []
 
-    tube_anns = {0: [], 1: [], 2: [], 3: []}
+    for local_i, img_info in enumerate(images_sel, start=0):
+        global_i = start_idx + local_i + 1  # 1-based do logu
+        img_id = img_info["id"]
+        img_path = os.path.join(dataset_dir, img_info["file_name"])
 
-    for ann in bubble_anns:
-        bbox = ann.get("bbox", None)
-        if bbox is None:
+        gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            print(f"[WARN] Nie mogę wczytać: {img_path} — pomijam")
             continue
-        x, y, w_box, h_box = map(float, bbox)
-        xc = x + 0.5 * w_box
-        yc = y + 0.5 * h_box
 
-        for i, tube in enumerate(tubes):
-            if point_in_tube(xc, yc, tube, margin_px=MARGIN_PX):
-                tube_anns[i].append(ann)
-                break
+        h, w = gray.shape
+        X_LEFT = 0
+        X_RIGHT = w - 1
 
-    vis2 = vis1.copy()
-    colors = [(255, 0, 0), (0, 255, 0),
-              (0, 0, 255), (255, 255, 0)]
-    for tube_id in range(4):
-        for ann in tube_anns[tube_id]:
-            m = ann_to_mask(ann, h, w)
-            vis2 = overlay_mask(vis2, m, color=colors[tube_id], alpha=0.45)
+        bubble_anns = [a for a in annotations if a["image_id"] == img_id and a["category_id"] == bubble_cat_id]
+        tube_anns = {0: [], 1: [], 2: [], 3: []}
 
-    show_step(vis2, "KROK 2: Bąble przypisane do rurek")
-    print("Liczba bąbli w rurkach:", [len(tube_anns[i]) for i in range(4)])
+        for ann in bubble_anns:
+            bbox = ann.get("bbox", None)
+            if bbox is None:
+                continue
+            x, y, w_box, h_box = map(float, bbox)
+            xc = x + 0.5 * w_box
+            yc = y + 0.5 * h_box
 
-    # ============================
-    # PARA 1: tube1 + tube2
-    # ============================
-    mask1_orig = build_bubble_mask_from_anns(tube_anns[0], h, w)  # TOP
-    mask2_orig = build_bubble_mask_from_anns(tube_anns[1], h, w)  # SIDE
+            for i_tube, tube in enumerate(tubes):
+                if point_in_tube(xc, yc, tube, margin_px=MARGIN_PX):
+                    tube_anns[i_tube].append(ann)
+                    break
 
-    rect1_s, rect2_s, quad1, quad2 = _rectify_and_align_pair(
-        mask1_orig, tubes[0],
-        mask2_orig, tubes[1],
-        x_left=X_LEFT, x_right=X_RIGHT,
-        inner_margin_px=INNER_MARGIN_PX,
-        keep_aspect=KEEP_ASPECT
-    )
+        # --- build tube masks (still OK), then rectify pipeline (same as before) ---
+        mask1_orig = build_bubble_mask_from_anns(tube_anns[0], h, w)
+        mask2_orig = build_bubble_mask_from_anns(tube_anns[1], h, w)
+        rect_top_12, rect_side_12, _, _ = rectify_and_align_pair(
+            mask1_orig, tubes[0],
+            mask2_orig, tubes[1],
+            x_left=X_LEFT, x_right=X_RIGHT,
+            inner_margin_px=INNER_MARGIN_PX,
+            keep_aspect=KEEP_ASPECT
+        )
 
-    show_step(rect1_s, "PAIR 1: TOP (tube1) po pipeline", cmap="gray")
-    show_step(rect2_s, "PAIR 1: SIDE (tube2) po pipeline", cmap="gray")
+        mask3_orig = build_bubble_mask_from_anns(tube_anns[2], h, w)
+        mask4_orig = build_bubble_mask_from_anns(tube_anns[3], h, w)
+        rect_top_34, rect_side_34, _, _ = rectify_and_align_pair(
+            mask3_orig, tubes[2],
+            mask4_orig, tubes[3],
+            x_left=X_LEFT, x_right=X_RIGHT,
+            inner_margin_px=INNER_MARGIN_PX,
+            keep_aspect=KEEP_ASPECT
+        )
 
-    vol_top_12, mm_per_px_12, voxel_mm_12 = project_mask_top_view_to_cylinder_volume(
-        rect1_s, diameter_mm=DIAMETER_MM, voxel_mm=VOXEL_MM, fill_full_chord=FILL_FULL_CHORD
-    )
-    vol_side_12, _, _ = project_mask_side_view_to_cylinder_volume(
-        rect2_s, diameter_mm=DIAMETER_MM, voxel_mm=voxel_mm_12, fill_full_chord=FILL_FULL_CHORD
-    )
-    vol_top_12, vol_side_12 = _unify_shapes(vol_top_12, vol_side_12)
-    inter_12 = np.logical_and(vol_top_12, vol_side_12)
+        # --- per-bubble reconstruction to avoid sticking ---
+        vol_12, voxel_mm_12, n_pairs_12 = reconstruct_pair_no_stick(
+            rect_top_12, rect_side_12,
+            diameter_mm=DIAMETER_MM,
+            voxel_mm=VOXEL_MM,
+            smooth_sigma_x=SMOOTH_SIGMA_X,
+            min_radius_vox=MIN_RADIUS_VOX,
+            min_area_cc=MIN_AREA_CC,
+            iou_thr=IOU_THR
+        )
 
-    print("\n[PAIR 1-2]")
-    print(f"[3D] voxel_mm={voxel_mm_12:.6f} mm/voxel  |  mm_per_px={mm_per_px_12:.6f} mm/px")
-    print(f"[3D] vol_top_12 filled = {int(vol_top_12.sum())}")
-    print(f"[3D] vol_side_12 filled = {int(vol_side_12.sum())}")
-    print(f"[3D] inter_12 filled = {int(inter_12.sum())}")
+        vol_34, voxel_mm_34, n_pairs_34 = reconstruct_pair_no_stick(
+            rect_top_34, rect_side_34,
+            diameter_mm=DIAMETER_MM,
+            voxel_mm=VOXEL_MM,
+            smooth_sigma_x=SMOOTH_SIGMA_X,
+            min_radius_vox=MIN_RADIUS_VOX,
+            min_area_cc=MIN_AREA_CC,
+            iou_thr=IOU_THR
+        )
 
-    # ============================
-    # PARA 2: tube3 + tube4
-    # ============================
-    mask3_orig = build_bubble_mask_from_anns(tube_anns[2], h, w)  # TOP
-    mask4_orig = build_bubble_mask_from_anns(tube_anns[3], h, w)  # SIDE
+        print(f"[frame {global_i} ({local_i+1}/{len(images_sel)})] {img_info['file_name']} | "
+              f"pairs12={n_pairs_12} filled12={int(vol_12.sum())} | "
+              f"pairs34={n_pairs_34} filled34={int(vol_34.sum())}")
 
-    rect3_s, rect4_s, quad3, quad4 = _rectify_and_align_pair(
-        mask3_orig, tubes[2],
-        mask4_orig, tubes[3],
-        x_left=X_LEFT, x_right=X_RIGHT,
-        inner_margin_px=INNER_MARGIN_PX,
-        keep_aspect=KEEP_ASPECT
-    )
+        frames_data.append({
+            "title": f"Frame {global_i}: {img_info['file_name']}",
+            "vol_12": vol_12,
+            "vox_12": voxel_mm_12,
+            "vol_34": vol_34,
+            "vox_34": voxel_mm_34,
+        })
 
-    show_step(rect3_s, "PAIR 3: TOP (tube3) po pipeline", cmap="gray")
-    show_step(rect4_s, "PAIR 4: SIDE (tube4) po pipeline", cmap="gray")
+    if not frames_data:
+        raise RuntimeError("Brak poprawnie przetworzonych klatek (nie wczytano obrazów?)")
 
-    # Uwaga: to jest inna para, ale nadal walec D=20 mm. voxel_mm bierzemy z tej pary (albo narzuć z 12).
-    vol_top_34, mm_per_px_34, voxel_mm_34 = project_mask_top_view_to_cylinder_volume(
-        rect3_s, diameter_mm=DIAMETER_MM, voxel_mm=VOXEL_MM, fill_full_chord=FILL_FULL_CHORD
-    )
-    vol_side_34, _, _ = project_mask_side_view_to_cylinder_volume(
-        rect4_s, diameter_mm=DIAMETER_MM, voxel_mm=voxel_mm_34, fill_full_chord=FILL_FULL_CHORD
-    )
-    vol_top_34, vol_side_34 = _unify_shapes(vol_top_34, vol_side_34)
-    inter_34 = np.logical_and(vol_top_34, vol_side_34)
-
-    print("\n[PAIR 3-4]")
-    print(f"[3D] voxel_mm={voxel_mm_34:.6f} mm/voxel  |  mm_per_px={mm_per_px_34:.6f} mm/px")
-    print(f"[3D] vol_top_34 filled = {int(vol_top_34.sum())}")
-    print(f"[3D] vol_side_34 filled = {int(vol_side_34.sum())}")
-    print(f"[3D] inter_34 filled = {int(inter_34.sum())}")
-
-    # ============================
-    # PyVista: pokaż obok siebie dwie chmury (intersection 1-2 oraz 3-4)
-    # ============================
-    # Jeśli chcesz, żeby obie chmury miały IDENTYCZNĄ skalę voxeli, możesz narzucić voxel_mm=voxel_mm_12
-    # i przeliczać drugą parę na to samo voxel_mm. Na razie pokazuję "jak jest" dla każdej pary.
-    # Żeby wyświetlić obok siebie w jednym oknie, trzeba mieć jeden voxel_mm (jednostki sceny).
-    # Najprościej: użyć voxel_mm_12 i voxel_mm_34 osobno -> ale wtedy jedna scena nie ma sensu.
-    # Rozwiązanie: wyświetlamy obok siebie, ale w tej samej jednostce (mm) — więc to OK,
-    # bo oba są w mm. W samej funkcji konwertujemy do mm i tyle.
-    pv_plot_two_pointclouds_side_by_side(
-        inter_12, inter_34,
-        voxel_mm=1.0,  # UWAGA: tu voxel_mm nie jest używany jako spacing, bo punkty są już w mm poniżej.
+    # Live preview: animates + KEEPS LAST FRAME until you close the window
+    pv_live_animate_keep_last(
+        frames_data,
         center_yz=True,
-        max_points=500_000,
+        max_points=200_000,
         point_size=3.0,
-        title_a="Intersection (tube1 & tube2)",
-        title_b="Intersection (tube3 & tube4)"
+        pause_s=0.25
     )
-
-    # Poprawka: w powyższej funkcji _volume_to_points_mm używa voxel_mm do przeliczenia.
-    # Musimy więc wywołać ją z właściwym voxel_mm per volume.
-    # Dlatego robimy dedykowane okno z dwoma subplotami manualnie:
-
-    # --- manual side-by-side with correct voxel sizes ---
-    pts12 = _volume_to_points_mm(inter_12, voxel_mm_12, center_yz=True, max_points=500_000)
-    pts34 = _volume_to_points_mm(inter_34, voxel_mm_34, center_yz=True, max_points=500_000)
-
-    p = pv.Plotter(shape=(1, 2), window_size=(1400, 700), title="Intersections 1-2 and 3-4")
-    p.subplot(0, 0)
-    p.add_text("Intersection (tube1 & tube2)", font_size=12)
-    if pts12 is not None:
-        p.add_points(pv.PolyData(pts12), render_points_as_spheres=True, point_size=3.0)
-    else:
-        p.add_text("EMPTY", font_size=18, position="upper_left")
-    p.add_axes()
-    p.show_grid()
-
-    p.subplot(0, 1)
-    p.add_text("Intersection (tube3 & tube4)", font_size=12)
-    if pts34 is not None:
-        p.add_points(pv.PolyData(pts34), render_points_as_spheres=True, point_size=3.0)
-    else:
-        p.add_text("EMPTY", font_size=18, position="upper_left")
-    p.add_axes()
-    p.show_grid()
-
-    p.link_views()
-    p.show()
-
-    # (opcjonalnie) isosurface osobno:
-    # pv_plot_isosurface(inter_12, voxel_mm=voxel_mm_12, center_yz=True, smooth_iters=20, title="Isosurface 1-2")
-    # pv_plot_isosurface(inter_34, voxel_mm=voxel_mm_34, center_yz=True, smooth_iters=20, title="Isosurface 3-4")
-
-    # (opcjonalnie) eksport PLY:
-    export_volume_to_ply_pointcloud(inter_12, "bubble_intersection_12.ply", voxel_mm=voxel_mm_12, center_yz=True)
-    export_volume_to_ply_pointcloud(inter_34, "bubble_intersection_34.ply", voxel_mm=voxel_mm_34, center_yz=True)
 
 
 if __name__ == "__main__":
-    main()
+    # start_frame = numer w posortowanej liście (1-based)
+    main(
+        start_frame=100,  # <- ustaw np. 475
+        n_frames=150
+    )
